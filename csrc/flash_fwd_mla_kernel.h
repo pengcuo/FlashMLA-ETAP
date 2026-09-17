@@ -226,11 +226,14 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
 
     __syncthreads();
 
-    // HERE
-    // How to transpose the result?
+    // 1) every thread stores its accumulator fragment of O^T (kHeadDimV x kBlockM) into smem_transpose_o
     cute::copy(smem_tiled_copy_Oaccum, taccOrOaccum, taccOsOaccum);
 
-    for(int idx = tidx; idx < size(sOaccum); idx += kNThreads) {
+    // 2) the transpose below reads elements that were written by *other* threads in step 1
+    __syncthreads();
+
+    // 3) transpose O^T -> O (kBlockM x kHeadDimV) so that the unchanged gmem epilogue can be reused
+    for (int idx = tidx; idx < size(sOaccum); idx += kNThreads) {
         int i = idx / kBlockM;
         int j = idx % kBlockM;
         sOaccum(j, i) = sOaccumTranspose(i, j);
@@ -329,7 +332,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     Tensor tOrO = partition_fragment_C(tiled_mma_o, Shape<Int<kHeadDimV>, Int<kBlockM>>{});  // ((MMA=4, X), MMA_M, MMA_N=1)
     clear(tOrO);
 
-    flash::Softmax<size<0>(tOrO) / 2 * size<2>(tOrO)> softmax;
+    flash::Softmax<size<0>(tOrO) / 2 * size<2>(tOrO), kNThreads, kNThreadsS> softmax;
 
     int warp_group_idx = cutlass::canonical_warp_group_idx();
     if (warp_group_idx == 0) {
@@ -390,12 +393,22 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                                                : softmax.template softmax</*Is_first=*/false, /*Check_inf=*//*Is_local=*/false>(tSrS, params.scale_softmax_log2);
 
             Tensor rP = flash::convert_type<Element>(tSrS);
-            cute::copy(rP, mtPsP); // we need to find max in shared memory, because we transpose the p matrix
+            cute::copy(rP, mtPsP);  // P^T goes through smem: it is the B operand of the (transposed) PV wgmma
             cute::copy(scale_o, tScale_osScale_o);
 
+            // sP is consumed by wgmma (async proxy) in BOTH warp groups, but it was written with plain
+            // st.shared (generic proxy). Make those writes visible to the async proxy before anybody is
+            // signalled, otherwise the PV gemm can read stale P from the previous iteration.
+            cutlass::arch::fence_view_async_shared();
+
+            // Signal the producer warp group: P and scale_o are ready.
             cutlass::arch::NamedBarrier::arrive(kNThreads, static_cast<int>(NamedBarriers::SReady));
 
             flash::rescale_o(tOrO, scale_o);
+
+            // The wgmma below reads the whole sP tile, i.e. also the rows written by the other three warps
+            // of this warp group. Wait until all kNThreadsS softmax threads have written (and fenced) their part.
+            cutlass::arch::NamedBarrier::sync(kNThreadsS, static_cast<int>(NamedBarriers::PReady));
 
             Tensor tSrP = thr_mma_o.partition_fragment_B(sPP);
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_o, tOrVt, tSrP, tOrO);
@@ -463,6 +476,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 #pragma unroll 1
         for (; n_block >= n_block_min; --n_block) {
             flash::cp_async_wait<0>();
+            // K/V were written by cp.async (generic proxy) and are consumed by wgmma (async proxy) in
+            // both warp groups: order the two proxies before the CTA barrier publishes the tile.
+            cutlass::arch::fence_view_async_shared();
             __syncthreads();
 
             if (n_block - 1 >= n_block_min) {
@@ -477,7 +493,10 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                 cute::cp_async_fence();
             }
 
-            __syncthreads();
+            // NOTE: deliberately no __syncthreads() here. The one that used to sit here only existed to
+            // "pair up" with the __syncthreads() inside the softmax warp group's cross-warp max reduction
+            // (softmax.h). That reduction now uses a 128-thread named barrier, so an extra CTA-wide
+            // barrier on this path would deadlock the kernel.
             cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::SReady));
 
             if (n_block - 2 >= n_block_min) {
