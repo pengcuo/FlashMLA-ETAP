@@ -11,6 +11,7 @@
 #include <cutlass/numeric_types.h>
 
 #include "utils.h"
+#include "named_barrier.h"
 
 #include <cstdio>
 #include <cooperative_groups.h>
@@ -97,76 +98,112 @@ __device__ __forceinline__ float compute_group_sum(float val) {
     return val;
 }
 
-template<typename Engine1, typename Layout1>
-__device__ __forceinline__ float group_4x8_4_max(Tensor<Engine1, Layout1> &max) {
-    const int query_size = 4;
-    __shared__ float shared_max[4][4 * query_size];
+// ---------------------------------------------------------------------------------------------------
+// Cross-thread reductions for the *transposed* score tile S^T = K * Q^T (kBlockN x kBlockM = 64 x 16).
+//
+// In the transposed wgmma accumulator layout every thread owns 4 query columns (kNRows == 4) and a few
+// key rows, so a softmax statistic (max / sum over the keys) has to be reduced
+//   (1) inside the thread                                  -> thread_reduce_()
+//   (2) across the 8 lanes of a warp that share lane % 4     -> compute_group_{max,sum}() (xor 16/8/4)
+//       (those lanes hold the same query columns)
+//   (3) across the warps of a warp group                     -> shared-memory exchange below
+// ---------------------------------------------------------------------------------------------------
 
-    int lane = threadIdx.x % 32;
-    int col = lane % 4;
-    int row = lane / 4;
-    int warp_id = threadIdx.x >> 5;
+// Step (3) for the running row max.
+//
+// This is executed inside the main loop by the kNThreadsSync (= 128) threads of the softmax warp group
+// ONLY, while the producer warp group is on a completely different code path (cp.async loads / its own
+// PV gemm). The barrier therefore has to be a *named* barrier covering exactly those threads.
+// A __syncthreads() here would have to be "matched" by an unrelated __syncthreads() somewhere in the
+// producer loop, which is undefined behaviour (the two warp groups are not converged) and deadlocks as
+// soon as the number of barriers on the two paths stops being identical.
+template<int kNThreadsSync, typename Engine1, typename Layout1>
+__device__ __forceinline__ void group_4x8_4_max(Tensor<Engine1, Layout1> &max) {
+    constexpr int query_size = decltype(size(max))::value;          // == kNRows (4 query columns / thread)
+    constexpr int kNWarpsSync = kNThreadsSync / 32;
+    static_assert(kNThreadsSync % 32 == 0, "named barriers count whole warps");
+    __shared__ float shared_max[kNWarpsSync][4 * query_size];
 
+    const int lane = threadIdx.x % 32;
+    const int col = lane % 4;
+    const int row = lane / 4;
+    const int warp_id = (threadIdx.x % kNThreadsSync) >> 5;         // warp index inside the warp group
+
+    #pragma unroll
     for (int mi = 0; mi < query_size; mi++) {
-        float val = max(mi);
-        float max_val = compute_group_max(val);
-        max(mi) = max_val;
+        max(mi) = compute_group_max(max(mi));
     }
 
-    if(row == 0) {
+    if (row == 0) {
+        #pragma unroll
         for (int mi = 0; mi < query_size; mi++) {
             shared_max[warp_id][col * query_size + mi] = max(mi);
         }
     }
-    __syncthreads();
+    // Only the softmax warp group takes part -> 128-thread named barrier, NOT __syncthreads().
+    cutlass::arch::NamedBarrier::sync(kNThreadsSync, static_cast<int>(NamedBarriers::SoftmaxMaxReduce));
 
+    #pragma unroll
     for (int mi = 0; mi < query_size; mi++) {
-        for (int r = 0; r < 4; r++) {
-            if(max(mi) < shared_max[r][col * query_size + mi]) {
-                max(mi) = shared_max[r][col * query_size + mi];
-            }
+        #pragma unroll
+        for (int r = 0; r < kNWarpsSync; r++) {
+            max(mi) = fmaxf(max(mi), shared_max[r][col * query_size + mi]);
         }
     }
+    // The write-after-read hazard on shared_max between two consecutive calls is covered by the
+    // __syncthreads() at the top of the main loop, which every thread of the CTA executes each iteration.
 }
 
-template<typename Engine1, typename Layout1>
-__device__ __forceinline__ float reduce_group_4x8_4_sum(Tensor<Engine1, Layout1> &sum) {
-    const int query_size = 4;
-    __shared__ float shared_sum[4][4 * query_size];
+// Step (3) for the row sum.
+//
+// Executed once, in the epilogue, by ALL kNThreads threads of the CTA (both warp groups hold identical
+// row_sum values at that point and both need the reduced value to normalise their half of O), so a
+// CTA-wide __syncthreads() is the right barrier here. Each warp group reduces across its own warps.
+template<int kNThreads, int kNThreadsPerGroup, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_group_4x8_4_sum(Tensor<Engine1, Layout1> &sum) {
+    constexpr int query_size = decltype(size(sum))::value;
+    constexpr int kNWarps = kNThreads / 32;
+    constexpr int kNWarpsPerGroup = kNThreadsPerGroup / 32;
+    static_assert(kNThreads % kNThreadsPerGroup == 0 && kNThreadsPerGroup % 32 == 0);
+    // Sized for every warp of the CTA: the old [4][...] array overflowed for warps 4..7 (warp group 1).
+    __shared__ float shared_sum[kNWarps][4 * query_size];
 
-    int lane = threadIdx.x % 32;
-    int col = lane % 4;
-    int row = lane / 4;
-    int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x % 32;
+    const int col = lane % 4;
+    const int row = lane / 4;
+    const int warp_id = threadIdx.x >> 5;
+    const int group_base = (warp_id / kNWarpsPerGroup) * kNWarpsPerGroup;
 
+    #pragma unroll
     for (int mi = 0; mi < query_size; mi++) {
-        float val = sum(mi);
-        float sum_val = compute_group_sum(val);
-        sum(mi) = sum_val;
+        sum(mi) = compute_group_sum(sum(mi));
     }
 
-    if(row == 0) {
+    if (row == 0) {
+        #pragma unroll
         for (int mi = 0; mi < query_size; mi++) {
             shared_sum[warp_id][col * query_size + mi] = sum(mi);
         }
     }
-    __syncthreads();
+    __syncthreads();   // all kNThreads threads of the CTA call this function
 
+    #pragma unroll
     for (int mi = 0; mi < query_size; mi++) {
         float all_warp_sum = 0.f;
-        for (int r = 0; r < 4; r++) {
-            all_warp_sum += shared_sum[r][col * query_size + mi];
+        #pragma unroll
+        for (int r = 0; r < kNWarpsPerGroup; r++) {
+            all_warp_sum += shared_sum[group_base + r][col * query_size + mi];
         }
         sum(mi) = all_warp_sum;
     }
 }
 
-template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+template<bool zero_init=true, int kNThreadsSync, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __device__ __forceinline__ void reduce_group_4x8_4_max(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &max){
     MaxOp<float> max_op;
     thread_reduce_<zero_init>(tensor, max, max_op);
 
-    group_4x8_4_max(max);
+    group_4x8_4_max<kNThreadsSync>(max);
 }
 
 template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
@@ -250,7 +287,9 @@ __forceinline__ __device__ void rescale_o(Tensor0 &acc_o, Tensor1 &scale_o) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int kNRows>
+// kNThreads  : threads per CTA (both warp groups) -> used by the epilogue row-sum reduction
+// kNThreadsS : threads of the softmax warp group   -> used by the in-loop row-max reduction
+template <int kNRows, int kNThreads = 256, int kNThreadsS = 128>
 struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
@@ -269,7 +308,7 @@ struct Softmax {
         if (Is_first) {
             // blockn = 64, row_max
             // flash::template reduce_max</*zero_init=*/true>(scores, row_max);
-            flash::template reduce_group_4x8_4_max</*zero_init=*/true>(scores, row_max);
+            flash::template reduce_group_4x8_4_max</*zero_init=*/true, kNThreadsS>(scores, row_max);
             flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
 
             flash::reduce_sum</*zero_init=*/true>(scores, row_sum);
@@ -277,7 +316,7 @@ struct Softmax {
             Tensor scores_max_prev = make_fragment_like(row_max);
             cute::copy(row_max, scores_max_prev);
             // flash::template reduce_max</*zero_init=*/false>(scores, row_max);
-            flash::template reduce_group_4x8_4_max</*zero_init=*/false>(scores, row_max);
+            flash::template reduce_group_4x8_4_max</*zero_init=*/false, kNThreadsS>(scores, row_max);
             // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
             #pragma unroll
             for (int mi = 0; mi < size(row_max); ++mi) {
@@ -298,9 +337,8 @@ struct Softmax {
 
     template<bool Is_dropout=false, bool Split=false, typename Tensor0>
     __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0) {
-        SumOp<float> sum_op;
         // quad_allreduce_(row_sum, row_sum, sum_op);
-        reduce_group_4x8_4_sum(row_sum);
+        reduce_group_4x8_4_sum<kNThreads, kNThreadsS>(row_sum);
 
         TensorT lse = make_fragment_like(row_sum);
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
