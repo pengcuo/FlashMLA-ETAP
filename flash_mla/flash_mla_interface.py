@@ -36,11 +36,11 @@ def flash_mla_with_kvcache(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
-        q: (batch_size, seq_len_q, num_heads_q, head_dim).
+        q: (batch_size, seq_len_q, num_heads_q, head_dim). head_dim is 576 (kv_lora_rank=512) or 320 (kv_lora_rank=256).
         k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
         block_table: (batch_size, max_num_blocks_per_seq), torch.int32.
         cache_seqlens: (batch_size), torch.int32.
-        head_dim_v: Head dimension of v.
+        head_dim_v: Head dimension of v, must be head_dim - 64 (512 or 256).
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), torch.int32, returned by get_mla_metadata.
         num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
         softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).

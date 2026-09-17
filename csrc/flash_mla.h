@@ -47,7 +47,7 @@ static constexpr int TileSchedulerMetaDataSize = 8;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename T, int Headdim>
+template<typename T, int Headdim, int HeaddimV>
 void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params &params, cudaStream_t stream);
 
 struct Mla_metadata_params {

@@ -114,7 +114,7 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
     )
 
 
-def main(torch_dtype):
+def main(torch_dtype, kv_lora_rank):
     device = torch.device("cuda:0")
     torch.set_default_dtype(torch_dtype)
     torch.set_default_device(device)
@@ -123,7 +123,7 @@ def main(torch_dtype):
     random.seed(0)
 
     h_kv = 1
-    d, dv = 576, 512
+    d, dv = kv_lora_rank + 64, kv_lora_rank  # head_dim = kv_lora_rank + qk_rope_head_dim
     causal = True
 
     for b in [128]:
@@ -144,10 +144,18 @@ if __name__ == "__main__":
         help="Data type to use for testing (bf16 or fp16)",
     )
 
+    parser.add_argument(
+        "--kv-lora-rank",
+        type=int,
+        choices=[512, 256],
+        default=512,
+        help="kv_lora_rank; head_dim = kv_lora_rank + 64, head_dim_v = kv_lora_rank (576/512 or 320/256)",
+    )
+
     args = parser.parse_args()
 
     torch_dtype = torch.bfloat16
     if args.dtype == "fp16":
         torch_dtype = torch.float16
 
-    main(torch_dtype)
+    main(torch_dtype, args.kv_lora_rank)
