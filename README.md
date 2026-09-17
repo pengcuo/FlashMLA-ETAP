@@ -19,7 +19,6 @@ On the NVIDIA H20, FlashMLA-ETAP reaches **89 TFLOPS at a 64K context (batch siz
 - [Installation](#installation)
 - [Usage](#usage)
 - [Testing and benchmarking](#testing-and-benchmarking)
-- [Release notes](#release-notes)
 - [Limitations](#limitations)
 - [Acknowledgements](#acknowledgements)
 - [Citation](#citation)
@@ -27,7 +26,7 @@ On the NVIDIA H20, FlashMLA-ETAP reaches **89 TFLOPS at a 64K context (batch siz
 
 ## Motivation
 
-Hopper's WarpGroup Matrix-Multiply-Accumulate (WGMMA) instructions require an $M$ dimension of at least 64. In the conventional attention formulation the $M$ dimension of both GEMMs is the number of query rows, i.e. `seq_len_q × num_heads_q / num_heads_kv`. During autoregressive decoding of DeepSeek-R1 on an 8-GPU H20 server, the 128 attention heads are split across the GPUs (16 heads per GPU) and each step decodes one token, so a GPU issues attention over **16 query rows**. The remaining 48 rows of every WGMMA tile are padding, and the paper reports compute utilization of **below 25%** for FlashMLA in this regime. The problem is most acute on the H20, whose FP16 tensor-core throughput (148 TFLOPS) is a small fraction of that of the H100/H800 (1979 TFLOPS), while its KV contexts are just as long. In this setting MLA accounts for roughly 30% of a decoding forward pass of DeepSeek-V3 (batch size 16, 16K context).
+Hopper's WarpGroup Matrix-Multiply-Accumulate (WGMMA) instructions require an $`M`$ dimension of at least 64. In the conventional attention formulation the $`M`$ dimension of both GEMMs is the number of query rows, i.e. `seq_len_q × num_heads_q / num_heads_kv`. During autoregressive decoding of DeepSeek-R1 on an 8-GPU H20 server, the 128 attention heads are split across the GPUs (16 heads per GPU) and each step decodes one token, so a GPU issues attention over **16 query rows**. The remaining 48 rows of every WGMMA tile are padding, and the paper reports compute utilization of **below 25%** for FlashMLA in this regime. The problem is most acute on the H20, whose FP16 tensor-core throughput (148 TFLOPS) is a small fraction of that of the H100/H800 (1979 TFLOPS), while its KV contexts are just as long. In this setting MLA accounts for roughly 30% of a decoding forward pass of DeepSeek-V3 (batch size 16, 16K context).
 
 ## Method: the Efficient Transpose Attention Pipeline
 
@@ -42,22 +41,22 @@ P^{\top} = \mathrm{softmax}(S^{\top}),\qquad
 O^{\top} = V^{\top} P^{\top} \in \mathbb{R}^{d \times N_q},\qquad
 O = (O^{\top})^{\top},$$
 
-where $N$ is the KV context length and $N_q$ the number of query rows. The KV context length now occupies the WGMMA $M$ dimension and the query rows occupy the $N$ dimension, which has no minimum-size constraint of 64. Padding on the query dimension is eliminated; the single transpose of the output is performed once per tile, whereas the two GEMMs benefit at every KV block. The gain grows with the ratio of context length to query length, which is exactly the decoding regime.
+where $`N`$ is the KV context length and $`N_q`$ the number of query rows. The KV context length now occupies the WGMMA $`M`$ dimension and the query rows occupy the $`N`$ dimension, which has no minimum-size constraint of 64. Padding on the query dimension is eliminated; the single transpose of the output is performed once per tile, whereas the two GEMMs benefit at every KV block. The gain grows with the ratio of context length to query length, which is exactly the decoding regime.
 
 | GEMM | Conventional layout (FlashMLA) | ETAP layout (this repository) |
 |---|---|---|
-| Scores | $M$ = query rows (padded to 64), $N$ = keys, $K$ = head_dim | $M$ = keys (64 per block), $N$ = query rows (16), $K$ = head_dim |
-| Output | $M$ = query rows (padded to 64), $N$ = head_dim_v, $K$ = keys | $M$ = head_dim_v, $N$ = query rows (16), $K$ = keys |
+| Scores | $`M`$ = query rows (padded to 64), $`N`$ = keys, $`K`$ = head_dim | $`M`$ = keys (64 per block), $`N`$ = query rows (16), $`K`$ = head_dim |
+| Output | $`M`$ = query rows (padded to 64), $`N`$ = head_dim_v, $`K`$ = keys | $`M`$ = head_dim_v, $`N`$ = query rows (16), $`K`$ = keys |
 
 ### Kernel structure
 
 FlashMLA-ETAP keeps FlashMLA's overall design (paged KV cache, split-KV scheduling with a combine kernel, variable-length batches) and re-implements the inner loop in the transposed form. Each CTA processes one tile of **16 query rows × 64 keys** per iteration with 256 threads organised as two warp groups:
 
-- **Consumer warp group 0** computes $S^{\top}_j = K_j Q^{\top}$ with a shared-memory WGMMA, runs the online softmax along the key axis (which now spans threads and warps: the running maximum is reduced across lanes and warps in every iteration, the row sums once in the epilogue), writes $P^{\top}_j$ and the rescale factors to shared memory, and accumulates the first half of $O^{\top}$ ($V_{j,0}^{\top} P^{\top}_j$).
-- **Producer warp group 1** streams the K/V pages from HBM into a double-buffered shared-memory ring with `cp.async`, waits for $P^{\top}_j$ via a named barrier, and accumulates the second half of $O^{\top}$ ($V_{j,1}^{\top} P^{\top}_j$).
-- **Epilogue**: both halves are normalised by the softmax denominator, $O^{\top}$ is transposed to $O$ in shared memory, and $O$ together with the log-sum-exp is written to HBM (or to the split-KV accumulators, which the combine kernel reduces).
+- **Consumer warp group 0** computes $`S^{\top}_j = K_j Q^{\top}`$ with a shared-memory WGMMA, runs the online softmax along the key axis (which now spans threads and warps: the running maximum is reduced across lanes and warps in every iteration, the row sums once in the epilogue), writes $`P^{\top}_j`$ and the rescale factors to shared memory, and accumulates the first half of $`O^{\top}`$ ($`V_{j,0}^{\top} P^{\top}_j`$).
+- **Producer warp group 1** streams the K/V pages from HBM into a double-buffered shared-memory ring with `cp.async`, waits for $`P^{\top}_j`$ via a named barrier, and accumulates the second half of $`O^{\top}`$ ($`V_{j,1}^{\top} P^{\top}_j`$).
+- **Epilogue**: both halves are normalised by the softmax denominator, $`O^{\top}`$ is transposed to $`O`$ in shared memory, and $`O`$ together with the log-sum-exp is written to HBM (or to the split-KV accumulators, which the combine kernel reduces).
 
-All producer/consumer hand-offs through shared memory are ordered with named barriers and `fence.proxy.async`, so results are deterministic across runs (see [Release notes](#release-notes)).
+All producer/consumer hand-offs through shared memory are ordered with named barriers and `fence.proxy.async`, so results are deterministic across runs.
 
 ## Performance
 
@@ -176,12 +175,6 @@ python tests/pengcuo_test_flash_mla.py [--dtype bf16|fp16]
 ```
 
 **Baselines.** `benchmark/pengcuo_test_fa3_mla.py` (requires FlashAttention-3, `flash_attn_interface`) and `benchmark/pengcuo_test_flashinfer_mla.py` (requires FlashInfer) time the paper's head count, head dimensions and context lengths with the two baseline libraries; both are hard-coded to batch size 32 and should be edited to match other configurations. `benchmark/bench_flash_mla.py` and `benchmark/visualize.py`, inherited from FlashMLA, provide a broader comparison against a PyTorch/Triton/FlashInfer baseline and plot the resulting CSV files.
-
-## Release notes
-
-- **2026-09 — Correctness fix ([#3](https://github.com/pengcuo/FlashMLA-ETAP/pull/3)).** Several shared-memory synchronization defects in the transposed pipeline were fixed: the hand-off of $P^{\top}$ to the second WGMMA lacked a proxy fence and a warp-group barrier, the epilogue transpose lacked a barrier, a cross-warp reduction used `__syncthreads()` on a single warp group, and a reduction buffer was indexed out of bounds. Earlier revisions could produce nondeterministic and, for some shapes, incorrect outputs (see the discussion in [#1](https://github.com/pengcuo/FlashMLA-ETAP/issues/1) and [#2](https://github.com/pengcuo/FlashMLA-ETAP/issues/2)). All users are encouraged to update.
-- **2026-09 — `kv_lora_rank = 256` ([#4](https://github.com/pengcuo/FlashMLA-ETAP/pull/4)).** `head_dim 320 / head_dim_v 256` is supported natively and dispatched at runtime.
-- **2025-05 — Initial release**; the baseline benchmark scripts and the arXiv paper followed in June 2025.
 
 ## Limitations
 
