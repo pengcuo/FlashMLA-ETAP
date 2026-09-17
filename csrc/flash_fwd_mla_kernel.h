@@ -65,6 +65,9 @@ struct Flash_fwd_kernel_traits_mla {
             Layout<Shape<Int<kNWarpsS / 4>, _1, _1>>{}));
 
     static constexpr int AtomLayoutNO = kNThreads / kNThreadsS;
+    // The PV wgmma splits head_dim_v across the AtomLayoutNO (= 2) warp groups; each slice is the wgmma M extent
+    // and must be a multiple of 64. (The split-KV combine kernel needs kHeadDimV % 128 == 0 as well.)
+    static_assert(kHeadDimV % (64 * AtomLayoutNO) == 0, "head_dim_v must be a multiple of 128");
     using TiledMmaO = decltype(make_tiled_mma(
             cute::GMMA::ss_op_selector<Element, Element, ElementAccum, Shape<Int<kHeadDimV / AtomLayoutNO>, Int<kBlockM>, Int<kBlockN>>,
                     GMMA::Major::MN, GMMA::Major::MN>(),
@@ -674,14 +677,16 @@ void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params &params, cudaStream_t stream
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<typename T, int Headdim>
+// One instantiation per supported (head_dim, head_dim_v) pair, see flash_fwd_mla_{bf16,fp16}_sm90.cu; the
+// runtime dispatch on head_size lives in flash_api.cpp. For MLA, head_dim = kv_lora_rank + qk_rope_head_dim (64)
+// and head_dim_v = kv_lora_rank, e.g. (576, 512) for DeepSeek-V2/V3 and (320, 256) for kv_lora_rank = 256.
+// The kernel constraints are checked in Flash_fwd_kernel_traits_mla (head_dim % 32 == 0, head_dim_v % 128 == 0,
+// head_dim_v <= head_dim).
+template<typename T, int Headdim, int HeaddimV>
 void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params &params, cudaStream_t stream) {
-    static_assert(Headdim == 576);
-    FLASH_ASSERT(params.d_v == 512);
+    FLASH_ASSERT(params.d == Headdim);
+    FLASH_ASSERT(params.d_v == HeaddimV);
     FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
-    // using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 64, 8, T, 512>;
-    // using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 16, 64, 8, T, 512>;
-    using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 16, 64, 8, T, 512>;
-    // using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 64, 8, T, 512>;
+    using Kernel_traits = Flash_fwd_kernel_traits_mla<Headdim, 16, 64, 8, T, HeaddimV>;
     run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
 }

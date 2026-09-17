@@ -10,6 +10,7 @@ FlashMLA is an efficient MLA decoding kernel for Hopper GPUs, optimized for vari
 Currently released:
 - BF16, FP16
 - Paged kvcache with block size of 64
+- Head dims `(head_dim, head_dim_v)` = `(576, 512)` (DeepSeek-V2/V3, `kv_lora_rank=512`) and `(320, 256)` (`kv_lora_rank=256`); `head_dim_v = head_dim - 64` (the 64 is `qk_rope_head_dim`)
 
 ## Requirements
 
@@ -30,6 +31,13 @@ python setup.py install
 
 ```bash
 python3 tests/pengcuo_test_flash_mla.py 
+```
+
+### Test
+
+```bash
+python tests/test_flash_mla.py                     # head_dim 576 / head_dim_v 512 (kv_lora_rank=512)
+python tests/test_flash_mla.py --kv-lora-rank 256  # head_dim 320 / head_dim_v 256 (kv_lora_rank=256)
 ```
 
 

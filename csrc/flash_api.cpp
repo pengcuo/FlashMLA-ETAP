@@ -184,14 +184,21 @@ mha_fwd_kvcache_mla(
     params.oaccum_ptr = out_accum.data_ptr();
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK(head_size == 576);
+    // Supported MLA shapes: head_size = kv_lora_rank + qk_rope_head_dim (64), head_size_v = kv_lora_rank.
+    // Adding a new pair = one more case here + the template instantiations in flash_fwd_mla_{bf16,fp16}_sm90.cu.
+    TORCH_CHECK(head_size == 576 || head_size == 320,
+                "FlashMLA-ETAP supports head_size 576 (kv_lora_rank=512) or 320 (kv_lora_rank=256), got ", head_size);
+    TORCH_CHECK(head_size_v == head_size - 64,
+                "head_size_v must be head_size - 64 (qk_rope_head_dim), got head_size=", head_size, ", head_size_v=", head_size_v);
 
     if (q_dtype == torch::kBFloat16) {
-        run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576>(params, stream);
+        if (head_size == 576) run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, 512>(params, stream);
+        else                  run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 320, 256>(params, stream);
     }
     #ifndef FLASH_MLA_DISABLE_FP16
     else if (q_dtype == torch::kHalf) {
-        run_mha_fwd_splitkv_mla<cutlass::half_t, 576>(params, stream);
+        if (head_size == 576) run_mha_fwd_splitkv_mla<cutlass::half_t, 576, 512>(params, stream);
+        else                  run_mha_fwd_splitkv_mla<cutlass::half_t, 320, 256>(params, stream);
     }
     #endif
     else {
