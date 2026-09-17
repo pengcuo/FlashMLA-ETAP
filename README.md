@@ -19,7 +19,6 @@ On the NVIDIA H20, FlashMLA-ETAP reaches **89 TFLOPS at a 64K context (batch siz
 - [Installation](#installation)
 - [Usage](#usage)
 - [Testing and benchmarking](#testing-and-benchmarking)
-- [Release notes](#release-notes)
 - [Limitations](#limitations)
 - [Acknowledgements](#acknowledgements)
 - [Citation](#citation)
@@ -57,7 +56,7 @@ FlashMLA-ETAP keeps FlashMLA's overall design (paged KV cache, split-KV scheduli
 - **Producer warp group 1** streams the K/V pages from HBM into a double-buffered shared-memory ring with `cp.async`, waits for $`P^{\top}_j`$ via a named barrier, and accumulates the second half of $`O^{\top}`$ ($`V_{j,1}^{\top} P^{\top}_j`$).
 - **Epilogue**: both halves are normalised by the softmax denominator, $`O^{\top}`$ is transposed to $`O`$ in shared memory, and $`O`$ together with the log-sum-exp is written to HBM (or to the split-KV accumulators, which the combine kernel reduces).
 
-All producer/consumer hand-offs through shared memory are ordered with named barriers and `fence.proxy.async`, so results are deterministic across runs (see [Release notes](#release-notes)).
+All producer/consumer hand-offs through shared memory are ordered with named barriers and `fence.proxy.async`, so results are deterministic across runs.
 
 ## Performance
 
@@ -176,12 +175,6 @@ python tests/pengcuo_test_flash_mla.py [--dtype bf16|fp16]
 ```
 
 **Baselines.** `benchmark/pengcuo_test_fa3_mla.py` (requires FlashAttention-3, `flash_attn_interface`) and `benchmark/pengcuo_test_flashinfer_mla.py` (requires FlashInfer) time the paper's head count, head dimensions and context lengths with the two baseline libraries; both are hard-coded to batch size 32 and should be edited to match other configurations. `benchmark/bench_flash_mla.py` and `benchmark/visualize.py`, inherited from FlashMLA, provide a broader comparison against a PyTorch/Triton/FlashInfer baseline and plot the resulting CSV files.
-
-## Release notes
-
-- **2026-09 — Correctness fix ([#3](https://github.com/pengcuo/FlashMLA-ETAP/pull/3)).** Several shared-memory synchronization defects in the transposed pipeline were fixed: the hand-off of $`P^{\top}`$ to the second WGMMA lacked a proxy fence and a warp-group barrier, the epilogue transpose lacked a barrier, a cross-warp reduction used `__syncthreads()` on a single warp group, and a reduction buffer was indexed out of bounds. Earlier revisions could produce nondeterministic and, for some shapes, incorrect outputs (see the discussion in [#1](https://github.com/pengcuo/FlashMLA-ETAP/issues/1) and [#2](https://github.com/pengcuo/FlashMLA-ETAP/issues/2)). All users are encouraged to update.
-- **2026-09 — `kv_lora_rank = 256` ([#4](https://github.com/pengcuo/FlashMLA-ETAP/pull/4)).** `head_dim 320 / head_dim_v 256` is supported natively and dispatched at runtime.
-- **2025-05 — Initial release**; the baseline benchmark scripts and the arXiv paper followed in June 2025.
 
 ## Limitations
 
